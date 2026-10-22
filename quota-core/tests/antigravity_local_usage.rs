@@ -37,7 +37,10 @@ fn the_compact_token_shows_only_the_gemini_pair() {
     // run Antigravity.
     let usage = normalize_quota_response(&quota_payload(), None);
 
-    assert_eq!(usage.compact_token().as_deref(), Some("5h 88% · Wk 74%"));
+    assert_eq!(
+        usage.compact_token().as_deref(),
+        Some("Gemini/Argon 5h 88% · Gemini/Argon Wk 74%")
+    );
 }
 
 #[test]
@@ -45,10 +48,60 @@ fn the_third_party_windows_are_still_carried_in_full() {
     let usage = normalize_quota_response(&quota_payload(), None);
 
     assert_eq!(usage.windows.len(), 4);
-    assert_eq!(usage.windows[2].label, "3p 5h");
+    assert_eq!(usage.windows[2].label, "Claude/GPT 5h");
     assert_eq!(usage.windows[2].remaining_percent, Some(50));
-    assert_eq!(usage.windows[3].label, "3p Wk");
+    assert_eq!(usage.windows[3].label, "Claude/GPT Wk");
     assert_eq!(usage.windows[3].remaining_percent, Some(31));
+}
+
+#[test]
+fn group_names_route_renamed_buckets_to_the_right_pool() {
+    // The vendor has renamed bucket ids before. A bucket whose id is new still
+    // lands in the right slot when its group names Gemini/Argon or Claude/GPT
+    // and its window says 5h or weekly.
+    let raw = json!({
+        "groups": [
+            {
+                "displayName": "Gemini 4 Argon",
+                "buckets": [
+                    { "bucketId": "argon-weekly", "window": "weekly", "remainingFraction": 0.6 }
+                ]
+            },
+            {
+                "displayName": "Claude and GPT models",
+                "buckets": [
+                    { "bucketId": "third-party-5h", "window": "5h", "remainingFraction": 0.4 }
+                ]
+            }
+        ]
+    });
+
+    let usage = normalize_quota_response(&raw, None);
+
+    assert_eq!(usage.windows[1].label, "Gemini/Argon Wk");
+    assert_eq!(usage.windows[1].remaining_percent, Some(60));
+    assert_eq!(usage.windows[2].label, "Claude/GPT 5h");
+    assert_eq!(usage.windows[2].remaining_percent, Some(40));
+}
+
+#[test]
+fn a_disabled_bucket_reports_zero_rather_than_a_stale_fraction() {
+    // Antigravity disables the 5-hour bucket once the weekly limit is
+    // exhausted; the raw fraction can still read 1.
+    let raw = json!({
+        "groups": [{
+            "displayName": "Claude and GPT models",
+            "buckets": [
+                { "bucketId": "3p-5h", "window": "5h", "remainingFraction": 1, "disabled": true },
+                { "bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0 }
+            ]
+        }]
+    });
+
+    let usage = normalize_quota_response(&raw, None);
+
+    assert_eq!(usage.windows[2].remaining_percent, Some(0));
+    assert_eq!(usage.windows[3].remaining_percent, Some(0));
 }
 
 #[test]

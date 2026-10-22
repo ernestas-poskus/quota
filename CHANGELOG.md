@@ -8,6 +8,10 @@ All notable changes to this project will be documented here.
 
 - Added `website/`, a homepage and docs site built with Astro and Starlight. It covers the desktop app, the VS Code extension, `quota-cli`, and the Herdr plugin, with screenshots, install steps, and direct download links for each release.
 
+### 🐛 Fixes
+
+- Antigravity's two shared pools now carry explicit labels: `Gemini/Argon` (including Gemini 4 Argon) and `Claude/GPT` (Claude Opus, Claude Sonnet, GPT-OSS). Renamed buckets are routed by group name plus the `window` discriminator, and a disabled 5-hour bucket reports 0 instead of its stale fraction.
+
 ## 1.7.1 and quota-vscode 1.5.2 - October 29, 2026
 
 Brings the Antigravity Gemini fix from `quota-cli` 0.2.4 to the desktop app and the VS Code extension.
