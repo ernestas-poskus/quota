@@ -24,12 +24,14 @@ quota-cli usage
 claude       5h 98% left (resets in 4h 58m) · Wk 35% left (resets in 3d 9h)
 codex        5h 100% left (resets in 4h 59m) · Wk 95% left (resets in 4d 6h)
 cursor       Plan 100% left (resets in 8d 3h)
-antigravity  5h 100% left (resets in 4h 59m) · Wk 97% left (resets in 6d 17h)
+antigravity  Gemini/Argon 5h 100% left (resets in 4h 59m) · Gemini/Argon Wk 97% left (resets in 6d 17h) · Claude/GPT 5h 100% left · Claude/GPT Wk 100% left
 grok         no credit allocation
 kiro         Credits 100% left · Bonus 100% left
 ```
 
 Percentages are what you have left, not what you have used. Reset times show when a provider reports one, and Kiro currently does not.
+
+Antigravity reports two shared pools, not per-model quotas: **Gemini/Argon** (Gemini 4 Argon and the Gemini models share it) and **Claude/GPT** (Claude Opus, Claude Sonnet, and GPT-OSS share it). Each pool has a 5-hour and a weekly window, so the four numbers are two pools × two windows.
 
 For scripting, `--json` prints the same data as an array:
 

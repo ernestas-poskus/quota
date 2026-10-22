@@ -59,11 +59,53 @@ const IDE_VERSION: &str = "1.20.5";
 const GOOGLE_API_NODEJS_CLIENT_VERSION: &str = "10.3.0";
 const X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 
-/// The two windows the compact token shows, in order.
-const TOKEN_BUCKETS: [(&str, &str); 2] = [("gemini-5h", "5h"), ("gemini-weekly", "Wk")];
-/// The other two, carried in the full model but kept out of the token. Four
-/// numbers stop being compact.
-const EXTRA_BUCKETS: [(&str, &str); 2] = [("3p-5h", "3p 5h"), ("3p-weekly", "3p Wk")];
+/// The four windows Antigravity reports, in the order the UI shows them.
+///
+/// The vendor groups models into two shared pools: Gemini (which includes
+/// Gemini 4 Argon) and Claude/GPT. Each pool has a 5-hour and a weekly bucket.
+/// There is no per-model quota to add: Claude Opus, Claude Sonnet and GPT-OSS
+/// all draw on the one Claude/GPT pool, and Gemini 4 Argon draws on the Gemini
+/// pool. The labels name the pool so the two groups are distinguishable.
+const WINDOWS: [WindowSpec; 4] = [
+    WindowSpec {
+        label: "Gemini/Argon 5h",
+        pool: Pool::Gemini,
+        weekly: false,
+        known_ids: &["gemini-5h", "argon-5h"],
+    },
+    WindowSpec {
+        label: "Gemini/Argon Wk",
+        pool: Pool::Gemini,
+        weekly: true,
+        known_ids: &["gemini-weekly", "argon-weekly"],
+    },
+    WindowSpec {
+        label: "Claude/GPT 5h",
+        pool: Pool::ThirdParty,
+        weekly: false,
+        known_ids: &["3p-5h", "claude-5h"],
+    },
+    WindowSpec {
+        label: "Claude/GPT Wk",
+        pool: Pool::ThirdParty,
+        weekly: true,
+        known_ids: &["3p-weekly", "claude-weekly"],
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pool {
+    Gemini,
+    ThirdParty,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WindowSpec {
+    label: &'static str,
+    pool: Pool,
+    weekly: bool,
+    known_ids: &'static [&'static str],
+}
 
 /// Convert the quota summary into windows, Gemini first so the compact token
 /// shows the pair people actually run Antigravity for.
@@ -72,9 +114,52 @@ const EXTRA_BUCKETS: [(&str, &str); 2] = [("3p-5h", "3p 5h"), ("3p-weekly", "3p 
 /// `remainingFraction`, which is already remaining rather than used. Nothing is
 /// inverted here.
 pub fn normalize_quota_response(raw: &Value, account_label: Option<String>) -> ProviderUsage {
-    let mut windows = Vec::with_capacity(4);
-    for (bucket_id, label) in TOKEN_BUCKETS.iter().chain(EXTRA_BUCKETS.iter()) {
-        windows.push(window_from(raw, bucket_id, label));
+    let mut windows: Vec<UsageWindow> = WINDOWS
+        .iter()
+        .map(|spec| UsageWindow {
+            label: spec.label.to_string(),
+            remaining_percent: None,
+            reset_at: None,
+        })
+        .collect();
+
+    // Known ids first, so a bucket that says exactly what it is wins over a
+    // group-name fallback for the same slot.
+    for (index, spec) in WINDOWS.iter().enumerate() {
+        if let Some(bucket) = find_bucket(raw, spec.known_ids) {
+            windows[index] = window_from(&bucket, spec.label);
+        }
+    }
+
+    // A renamed bucket still lands in the right slot when its group says
+    // "Gemini"/"Argon" or "Claude"/"GPT" and its window says 5h/weekly. This is
+    // what makes a new model family visible without another exact-id list.
+    if let Some(groups) = raw.get("groups").and_then(Value::as_array) {
+        for group in groups {
+            let group_name = group
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
+                continue;
+            };
+            for bucket in buckets {
+                let id = bucket.get("bucketId").and_then(Value::as_str).unwrap_or("");
+                let window = bucket.get("window").and_then(Value::as_str);
+                let Some((pool, weekly)) = classify(id, group_name, window) else {
+                    continue;
+                };
+                let Some(index) = WINDOWS
+                    .iter()
+                    .position(|spec| spec.pool == pool && spec.weekly == weekly)
+                else {
+                    continue;
+                };
+                if windows[index].remaining_percent.is_none() {
+                    windows[index] = window_from(bucket, WINDOWS[index].label);
+                }
+            }
+        }
     }
 
     ProviderUsage {
@@ -85,31 +170,71 @@ pub fn normalize_quota_response(raw: &Value, account_label: Option<String>) -> P
     }
 }
 
-fn window_from(raw: &Value, bucket_id: &str, label: &str) -> UsageWindow {
-    let bucket = find_bucket(raw, bucket_id);
+/// Which shared pool and window a bucket describes, from the bucket id, the
+/// group display name, or the `window` discriminator. The vendor has renamed
+/// bucket ids before; the group name is the durable part.
+fn classify(id: &str, group: &str, window: Option<&str>) -> Option<(Pool, bool)> {
+    let id = id.to_ascii_lowercase();
+    let group = group.to_ascii_lowercase();
+    let weekly = match window {
+        Some("weekly") => true,
+        Some("5h") => false,
+        _ if id.ends_with("weekly") => true,
+        _ if id.ends_with("5h") => false,
+        _ => return None,
+    };
+    // The bucket id is the most specific signal; the group name is the fallback
+    // for a renamed id. Do not let a group name override an id that says `3p`.
+    let pool = if id.starts_with("gemini") || id.starts_with("argon") {
+        Pool::Gemini
+    } else if id.starts_with("3p") || id.starts_with("claude") || id.starts_with("gpt") {
+        Pool::ThirdParty
+    } else if group.contains("gemini") || group.contains("argon") {
+        Pool::Gemini
+    } else if group.contains("claude") || group.contains("gpt") {
+        Pool::ThirdParty
+    } else {
+        return None;
+    };
+    Some((pool, weekly))
+}
+
+fn window_from(bucket: &Value, label: &str) -> UsageWindow {
+    // A disabled bucket is not usable quota: Antigravity disables the 5-hour
+    // bucket once the paired weekly limit is exhausted, and the raw fraction
+    // can still read 1. Reporting 0 is the honest answer.
+    let disabled = bucket
+        .get("disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     UsageWindow {
         label: label.to_string(),
-        remaining_percent: bucket
-            .as_ref()
-            .and_then(|item| item.get("remainingFraction"))
-            .and_then(as_number)
-            .map(|fraction| (fraction * 100.0).round().clamp(0.0, 100.0) as i32),
-        reset_at: bucket
-            .as_ref()
-            .and_then(|item| item.get("resetTime"))
-            .and_then(parse_reset_at),
+        remaining_percent: if disabled {
+            Some(0)
+        } else {
+            bucket
+                .get("remainingFraction")
+                .and_then(as_number)
+                .map(|fraction| (fraction * 100.0).round().clamp(0.0, 100.0) as i32)
+        },
+        reset_at: bucket.get("resetTime").and_then(parse_reset_at),
     }
 }
 
-/// Buckets are nested inside groups, and the grouping carries no meaning we
-/// need, so this flattens and matches on the bucket id.
-fn find_bucket(raw: &Value, bucket_id: &str) -> Option<Value> {
+/// Buckets are nested inside groups; the caller supplies the ids that have
+/// historically named a slot.
+fn find_bucket(raw: &Value, bucket_ids: &[&str]) -> Option<Value> {
     raw.get("groups")?
         .as_array()?
         .iter()
         .filter_map(|group| group.get("buckets")?.as_array())
         .flatten()
-        .find(|bucket| bucket.get("bucketId").and_then(Value::as_str) == Some(bucket_id))
+        .find(|bucket| {
+            bucket
+                .get("bucketId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| bucket_ids.contains(&id))
+        })
         .cloned()
 }
 
