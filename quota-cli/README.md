@@ -24,14 +24,14 @@ quota-cli usage
 claude       5h 98% left (resets in 4h 58m) · Wk 35% left (resets in 3d 9h)
 codex        5h 100% left (resets in 4h 59m) · Wk 95% left (resets in 4d 6h)
 cursor       Plan 100% left (resets in 8d 3h)
-antigravity  Gemini/Argon 5h 100% left (resets in 4h 59m) · Gemini/Argon Wk 97% left (resets in 6d 17h) · Claude/GPT 5h 100% left · Claude/GPT Wk 100% left
+antigravity  Gemini/Argon 5h 100% left (resets in 4h 59m) · Gemini/Argon Wk 97% left (resets in 6d 17h) · Claude/GPT 5h 100% left · Claude/GPT Wk 100% left · Gemini 4 Argon Wk 100% left
 grok         no credit allocation
 kiro         Credits 100% left · Bonus 100% left
 ```
 
 Percentages are what you have left, not what you have used. Reset times show when a provider reports one, and Kiro currently does not.
 
-Antigravity reports two shared pools, not per-model quotas: **Gemini/Argon** (the Gemini models) and **Claude/GPT** (Claude Opus, Claude Sonnet, and GPT-OSS share it). Each pool has a 5-hour and a weekly window. Gemini's 5-hour reading comes from the model quota block; the Gemini weekly window and the separate `Gemini 4 Argon` weekly allowance only appear when Antigravity's AI Code quota summary exposes them (consumer sign-ins currently expose only the Claude/GPT group), so those two can be blank. Antigravity's keychain entry is read through `/usr/bin/security` on macOS, so no unlock prompt appears.
+Antigravity reports two shared pools, not per-model quotas: **Gemini/Argon** (the Gemini models) and **Claude/GPT** (Claude Opus, Claude Sonnet, and GPT-OSS share it). Both pools' 5-hour and weekly windows come from the quota summary; a missing Gemini 5-hour reading is recovered from the per-model quota block in the models response. The separate `Gemini 4 Argon` weekly allowance is not exposed by any quota API Quota can reach with a consumer sign-in, so when it is missing `quota-cli` runs the Antigravity CLI's own `/quota` view (`agy -p "/quota" --output-format json`) and merges what it reports. Unlike the readers above, that fallback runs the vendor CLI itself; it adds a few seconds to a refresh and can be disabled with `QUOTA_NO_AGY=1`. Antigravity's keychain entry is read through `/usr/bin/security` on macOS, so no unlock prompt appears.
 
 For scripting, `--json` prints the same data as an array:
 

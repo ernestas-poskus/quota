@@ -1,6 +1,6 @@
 use quota_core::antigravity::local_usage::{
-    gemini_quota_from_models, normalize_quota_response, normalize_quota_summaries, project_id,
-    user_agent,
+    agy_quota_summary, gemini_quota_from_models, needs_agy_fallback, normalize_quota_response,
+    normalize_quota_summaries, project_id, user_agent,
 };
 use serde_json::json;
 
@@ -387,4 +387,106 @@ fn the_other_code_assist_calls_keep_the_ide_user_agent() {
     assert!(user_agent("v1internal:fetchAvailableModels").starts_with("antigravity/1."));
     let load = user_agent("v1internal:loadCodeAssist");
     assert!(load.starts_with("antigravity/1.") && load.contains("google-api-nodejs-client/"));
+}
+
+/// The Antigravity CLI's `/quota --output-format json` payload, trimmed to the
+/// fields Quota reads. The buckets use snake_case and `id`/`name` spellings.
+fn agy_output() -> serde_json::Value {
+    json!({
+        "status": "SUCCESS",
+        "response": "Gemini Models\tWeekly Limit Remaining\t53%\t2027-01-01T00:00:00Z\n",
+        "command": {
+            "name": "usage",
+            "data": {
+                "description": "Within each group, models share a weekly limit and a 5-hour limit.",
+                "groups": [
+                    {
+                        "name": "Gemini Models",
+                        "buckets": [
+                            { "id": "gemini-weekly", "name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.5253065824508667, "reset_time": "2027-01-01T00:00:00Z" },
+                            { "id": "gemini-5h", "name": "Five Hour Limit Remaining", "window": "5h", "remaining_fraction": 0.9374297857284546, "reset_time": "2027-01-01T00:00:00Z" }
+                        ]
+                    },
+                    {
+                        "name": "Claude and GPT models",
+                        "buckets": [
+                            { "id": "3p-weekly", "name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0, "reset_time": "2027-01-01T00:00:00Z" },
+                            { "id": "3p-5h", "name": "Five Hour Limit Remaining", "window": "5h", "disabled": true, "remaining_fraction": 1 }
+                        ]
+                    },
+                    {
+                        "name": "Gemini 4 Argon",
+                        "buckets": [
+                            { "id": "gemini-argon-wtu-weekly", "name": "Gemini 4 Argon Weekly Limit", "window": "weekly", "remaining_fraction": 1, "reset_time": "2027-01-01T00:00:00Z" }
+                        ]
+                    }
+                ]
+            }
+        }
+    })
+}
+
+#[test]
+fn the_agy_quota_view_is_normalized_like_an_api_summary() {
+    let summary = agy_quota_summary(&agy_output()).expect("convert the CLI view");
+
+    let usage = normalize_quota_summaries(&[&summary], None);
+
+    assert_eq!(usage.windows.len(), 5);
+    assert_eq!(usage.windows[0].remaining_percent, Some(94));
+    assert_eq!(usage.windows[1].label, "Gemini/Argon Wk");
+    assert_eq!(usage.windows[1].remaining_percent, Some(53));
+    assert_eq!(usage.windows[1].reset_at, Some(1_798_761_600));
+    assert_eq!(usage.windows[2].remaining_percent, Some(0));
+    assert_eq!(usage.windows[3].remaining_percent, Some(0));
+    assert_eq!(usage.windows[4].label, "Gemini 4 Argon Wk");
+    assert_eq!(usage.windows[4].remaining_percent, Some(100));
+}
+
+#[test]
+fn the_agy_fallback_fills_the_weekly_window_the_apis_leave_blank() {
+    // The models response covers the 5-hour window; the CLI view supplies the
+    // Gemini weekly window and the Argon allowance the APIs do not report.
+    let derived = gemini_quota_from_models(&models_payload()).expect("derive Gemini summary");
+    let agy = agy_quota_summary(&agy_output()).expect("convert the CLI view");
+
+    let usage = normalize_quota_summaries(&[&derived, &agy], None);
+
+    assert_eq!(usage.windows[0].remaining_percent, Some(90));
+    assert_eq!(usage.windows[1].remaining_percent, Some(53));
+    assert_eq!(usage.windows[4].label, "Gemini 4 Argon Wk");
+    assert_eq!(usage.windows[4].remaining_percent, Some(100));
+}
+
+#[test]
+fn an_agy_view_without_a_command_payload_is_ignored() {
+    assert!(agy_quota_summary(&json!({})).is_none());
+    assert!(agy_quota_summary(&json!({ "status": "ERROR", "response": "" })).is_none());
+    assert!(agy_quota_summary(&json!({ "command": { "data": { "groups": [] } } })).is_none());
+}
+
+#[test]
+fn the_cli_is_asked_when_the_argon_allowance_is_missing() {
+    // Cloud Code reports the Gemini weekly window, but the separate Gemini 4
+    // Argon allowance is only in the CLI's own view.
+    let cloud = quota_payload();
+
+    assert!(needs_agy_fallback(&[&cloud]));
+}
+
+#[test]
+fn the_cli_is_asked_when_the_gemini_weekly_window_is_missing() {
+    // The models response only recovers the 5-hour reading, so the weekly
+    // window still needs a source.
+    let derived = gemini_quota_from_models(&models_payload()).expect("derive Gemini summary");
+
+    assert!(needs_agy_fallback(&[&derived]));
+}
+
+#[test]
+fn the_cli_is_not_asked_when_the_apis_cover_the_windows_it_reports() {
+    let cloud = quota_payload();
+    let agy = agy_quota_summary(&agy_output()).expect("convert the CLI view");
+
+    assert!(!needs_agy_fallback(&[&cloud, &agy]));
 }

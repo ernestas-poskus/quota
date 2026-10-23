@@ -61,6 +61,17 @@ const RETRIEVE_QUOTA_ENDPOINT: &str = "v1internal:retrieveUserQuotaSummary";
 const AICODE_QUOTA_ENDPOINT: &str =
     "https://aicode.googleapis.com/v1alpha/remote:getUserQuotaSummary";
 
+/// The Antigravity CLI's own quota view, in print mode with structured output.
+///
+/// The CLI renders the Gemini weekly window and the separate `Gemini 4 Argon`
+/// allowance from data that none of the quota endpoints Quota can reach with a
+/// consumer sign-in expose, so those windows are borrowed from the CLI itself.
+const AGY_QUOTA_ARGS: [&str; 4] = ["-p", "/quota", "--output-format", "json"];
+
+/// A signed-out CLI can wait on an OAuth flow. The report is a status line, not
+/// a login prompt, so the fallback is abandoned after this long.
+const AGY_QUOTA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 const IDE_VERSION: &str = "1.20.5";
 const GOOGLE_API_NODEJS_CLIENT_VERSION: &str = "10.3.0";
 /// Google only returns the Gemini quota group to the Antigravity CLI's user agent.
@@ -290,6 +301,57 @@ pub fn gemini_quota_from_models(models: &Value) -> Option<Value> {
     }))
 }
 
+/// Convert the Antigravity CLI's `/quota --output-format json` view into the
+/// summary shape the normalizer already understands.
+///
+/// The CLI's command payload uses snake_case (`remaining_fraction`,
+/// `reset_time`, bucket `id`/`name`) and group `name`, so the fields are
+/// renamed here rather than teaching the normalizer every spelling.
+pub fn agy_quota_summary(output: &Value) -> Option<Value> {
+    let data = output.get("command")?.get("data")?;
+    let groups = data.get("groups")?.as_array()?;
+    if groups.is_empty() {
+        return None;
+    }
+
+    let groups: Vec<Value> = groups
+        .iter()
+        .map(|group| {
+            let buckets: Vec<Value> = group
+                .get("buckets")
+                .and_then(Value::as_array)
+                .map(|buckets| {
+                    buckets
+                        .iter()
+                        .map(|bucket| {
+                            json!({
+                                "bucketId": bucket.get("id").cloned().unwrap_or(Value::Null),
+                                "displayName": bucket.get("name").cloned().unwrap_or(Value::Null),
+                                "window": bucket.get("window").cloned().unwrap_or(Value::Null),
+                                "remainingFraction": bucket
+                                    .get("remaining_fraction")
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
+                                "resetTime": bucket.get("reset_time").cloned().unwrap_or(Value::Null),
+                                "disabled": bucket
+                                    .get("disabled")
+                                    .cloned()
+                                    .unwrap_or(Value::Bool(false)),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            json!({
+                "displayName": group.get("name").cloned().unwrap_or(Value::Null),
+                "buckets": buckets,
+            })
+        })
+        .collect();
+
+    Some(json!({ "groups": groups }))
+}
+
 /// Which pool and window a bucket describes.
 ///
 /// The group display name wins over the bucket id: a bucket named `argon-*`
@@ -486,9 +548,11 @@ pub async fn fetch_local_usage() -> Result<ProviderUsage, LocalUsageError> {
     )
     .await?;
 
-    // The Gemini pool is not part of the Cloud Code summary. Ask the AI Code
-    // summary as well, and recover at least the 5-hour reading from the models
-    // response when the summaries do not carry it.
+    // The Cloud Code summary is the source the desktop app and the extension
+    // already trust, so it wins when it reports a window. Ask the AI Code
+    // summary as well, since it has carried groups the Cloud Code one omitted,
+    // and recover at least the 5-hour reading from the models response when the
+    // summaries do not carry it.
     let aicode = fetch_aicode_quota(&client, &access_token).await.ok();
     let models_quota = gemini_quota_from_models(&models);
 
@@ -501,13 +565,26 @@ pub async fn fetch_local_usage() -> Result<ProviderUsage, LocalUsageError> {
     )
     .await?;
 
-    // AI Code first: when more than one source describes a window, its reading
-    // wins, then the models fallback, then the Cloud Code summary.
-    let summaries: Vec<&Value> = aicode
-        .iter()
+    // Cloud Code first, then AI Code, then the models fallback: when more than
+    // one source describes a window, the earliest reading wins.
+    let mut summaries: Vec<&Value> = std::iter::once(&quota)
+        .chain(aicode.iter())
         .chain(models_quota.iter())
-        .chain(std::iter::once(&quota))
         .collect();
+
+    // The separate Gemini 4 Argon allowance is not in any of those responses
+    // today. Borrow it from the Antigravity CLI, which renders it from its own
+    // backend. That is the only source for those windows, so the CLI is asked
+    // whenever the APIs leave the Gemini weekly or Argon weekly window blank;
+    // the result is merged last and therefore only fills gaps.
+    let agy_quota = if needs_agy_fallback(&summaries) {
+        fetch_agy_quota().await
+    } else {
+        None
+    };
+    if let Some(value) = agy_quota.as_ref() {
+        summaries.push(value);
+    }
 
     Ok(normalize_quota_summaries(
         &summaries,
@@ -622,12 +699,56 @@ async fn post_code_assist(
         .map_err(|_| LocalUsageError::Request(format!("{} returned unreadable JSON", endpoint)))
 }
 
+/// Borrow the Antigravity CLI's quota view for the windows the APIs leave blank.
+///
+/// Returns `None` when the CLI is not on `PATH`, when `QUOTA_NO_AGY` is set, or
+/// when it fails to answer within the timeout. Everything is best-effort: a
+/// missing CLI only leaves the weekly windows blank, as before.
+async fn fetch_agy_quota() -> Option<Value> {
+    if std::env::var_os("QUOTA_NO_AGY").is_some() {
+        return None;
+    }
+
+    let mut command = tokio::process::Command::new("agy");
+    command
+        .args(AGY_QUOTA_ARGS)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(AGY_QUOTA_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let parsed: Value = serde_json::from_slice(&output.stdout).ok()?;
+    agy_quota_summary(&parsed)
+}
+
+/// Does any of the summaries carry this pool/window pair?
+fn has_window(summaries: &[&Value], pool: Pool, weekly: bool) -> bool {
+    collect_buckets(summaries)
+        .iter()
+        .any(|bucket| bucket.pool == pool && bucket.weekly == weekly)
+}
+
+/// Whether the API summaries are missing a window only the Antigravity CLI
+/// reports. `agy` is a subprocess, so it is only asked when the response would
+/// otherwise leave a blank the CLI can fill.
+pub fn needs_agy_fallback(summaries: &[&Value]) -> bool {
+    !has_window(summaries, Pool::Gemini, true) || !has_window(summaries, Pool::Argon, true)
+}
+
 /// Read the AI Code quota summary with the same token the Cloud Code calls use.
 ///
-/// This is the only source for the Gemini pool's weekly window and for the
-/// separate Gemini 4 Argon allowance, so it is worth a request of its own. The
-/// endpoint requires the `auth/aicode` OAuth scope; a token without it fails
-/// with 403, which the caller treats as "Gemini numbers unavailable".
+/// The two backends have not always returned the same groups, so both are
+/// asked. The endpoint requires the `auth/aicode` OAuth scope in some
+/// deployments; a token without it fails with 403, which the caller treats as
+/// "this summary has nothing to add".
 async fn fetch_aicode_quota(
     client: &reqwest::Client,
     access_token: &str,
