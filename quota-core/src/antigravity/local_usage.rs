@@ -55,43 +55,62 @@ const LOAD_ENDPOINT: &str = "v1internal:loadCodeAssist";
 const FETCH_MODELS_ENDPOINT: &str = "v1internal:fetchAvailableModels";
 const RETRIEVE_QUOTA_ENDPOINT: &str = "v1internal:retrieveUserQuotaSummary";
 
+/// The Antigravity product quota summary. It accepts the same group/bucket
+/// shape as the Cloud Code summary below and is asked as well, because the two
+/// backends have not always returned the same groups.
+const AICODE_QUOTA_ENDPOINT: &str =
+    "https://aicode.googleapis.com/v1alpha/remote:getUserQuotaSummary";
+
 const IDE_VERSION: &str = "1.20.5";
 const GOOGLE_API_NODEJS_CLIENT_VERSION: &str = "10.3.0";
 /// Google only returns the Gemini quota group to the Antigravity CLI's user agent.
 const CLI_VERSION: &str = "1.4.10";
 const X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 
-/// The four windows Antigravity reports, in the order the UI shows them.
+/// The four windows every Antigravity account is expected to report, in the
+/// order the sidebar shows them.
 ///
-/// The vendor groups models into two shared pools: Gemini (which includes
-/// Gemini 4 Argon) and Claude/GPT. Each pool has a 5-hour and a weekly bucket.
-/// There is no per-model quota to add: Claude Opus, Claude Sonnet and GPT-OSS
-/// all draw on the one Claude/GPT pool, and Gemini 4 Argon draws on the Gemini
-/// pool. The labels name the pool so the two groups are distinguishable.
+/// The vendor groups models into shared pools: Gemini and Claude/GPT, each with
+/// a 5-hour and a weekly window. The slots stay present when a pool is missing
+/// from the response so the caller can tell "this account has no Gemini quota"
+/// from "this provider is broken", and so the compact token always keeps the
+/// Gemini pair in front.
 const WINDOWS: [WindowSpec; 4] = [
     WindowSpec {
         label: "Gemini/Argon 5h",
         pool: Pool::Gemini,
         weekly: false,
-        known_ids: &["gemini-5h", "argon-5h"],
     },
     WindowSpec {
         label: "Gemini/Argon Wk",
         pool: Pool::Gemini,
         weekly: true,
-        known_ids: &["gemini-weekly", "argon-weekly"],
     },
     WindowSpec {
         label: "Claude/GPT 5h",
         pool: Pool::ThirdParty,
         weekly: false,
-        known_ids: &["3p-5h", "claude-5h"],
     },
     WindowSpec {
         label: "Claude/GPT Wk",
         pool: Pool::ThirdParty,
         weekly: true,
-        known_ids: &["3p-weekly", "claude-weekly"],
+    },
+];
+
+/// Antigravity's own quota view shows `Gemini 4 Argon` as a separate allowance.
+/// Its windows are appended to the report only when a summary carries the group,
+/// so accounts without it do not grow a permanently blank row.
+const ARGON_WINDOWS: [WindowSpec; 2] = [
+    WindowSpec {
+        label: "Gemini 4 Argon 5h",
+        pool: Pool::Argon,
+        weekly: false,
+    },
+    WindowSpec {
+        label: "Gemini 4 Argon Wk",
+        pool: Pool::Argon,
+        weekly: true,
     },
 ];
 
@@ -99,6 +118,7 @@ const WINDOWS: [WindowSpec; 4] = [
 enum Pool {
     Gemini,
     ThirdParty,
+    Argon,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,61 +126,43 @@ struct WindowSpec {
     label: &'static str,
     pool: Pool,
     weekly: bool,
-    known_ids: &'static [&'static str],
 }
 
-/// Convert the quota summary into windows, Gemini first so the compact token
+/// Convert a quota summary into windows, Gemini first so the compact token
 /// shows the pair people actually run Antigravity for.
 ///
 /// Antigravity is the exception among these providers: it reports
 /// `remainingFraction`, which is already remaining rather than used. Nothing is
 /// inverted here.
 pub fn normalize_quota_response(raw: &Value, account_label: Option<String>) -> ProviderUsage {
+    normalize_quota_summaries(&[raw], account_label)
+}
+
+/// Convert one or more quota summaries into a single usage record.
+///
+/// Summaries are merged with the earlier source winning, so a window that more
+/// than one source describes keeps the first reading the caller supplies.
+pub fn normalize_quota_summaries(
+    summaries: &[&Value],
+    account_label: Option<String>,
+) -> ProviderUsage {
+    let buckets = collect_buckets(summaries);
+
     let mut windows: Vec<UsageWindow> = WINDOWS
         .iter()
-        .map(|spec| UsageWindow {
-            label: spec.label.to_string(),
-            remaining_percent: None,
-            reset_at: None,
+        .map(|spec| match locate(&buckets, spec) {
+            Some(bucket) => window_from(bucket, spec.label),
+            None => UsageWindow {
+                label: spec.label.to_string(),
+                remaining_percent: None,
+                reset_at: None,
+            },
         })
         .collect();
 
-    // Known ids first, so a bucket that says exactly what it is wins over a
-    // group-name fallback for the same slot.
-    for (index, spec) in WINDOWS.iter().enumerate() {
-        if let Some(bucket) = find_bucket(raw, spec.known_ids) {
-            windows[index] = window_from(&bucket, spec.label);
-        }
-    }
-
-    // A renamed bucket still lands in the right slot when its group says
-    // "Gemini"/"Argon" or "Claude"/"GPT" and its window says 5h/weekly. This is
-    // what makes a new model family visible without another exact-id list.
-    if let Some(groups) = raw.get("groups").and_then(Value::as_array) {
-        for group in groups {
-            let group_name = group
-                .get("displayName")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
-                continue;
-            };
-            for bucket in buckets {
-                let id = bucket.get("bucketId").and_then(Value::as_str).unwrap_or("");
-                let window = bucket.get("window").and_then(Value::as_str);
-                let Some((pool, weekly)) = classify(id, group_name, window) else {
-                    continue;
-                };
-                let Some(index) = WINDOWS
-                    .iter()
-                    .position(|spec| spec.pool == pool && spec.weekly == weekly)
-                else {
-                    continue;
-                };
-                if windows[index].remaining_percent.is_none() {
-                    windows[index] = window_from(bucket, WINDOWS[index].label);
-                }
-            }
+    for spec in ARGON_WINDOWS.iter() {
+        if let Some(bucket) = locate(&buckets, spec) {
+            windows.push(window_from(bucket, spec.label));
         }
     }
 
@@ -172,28 +174,150 @@ pub fn normalize_quota_response(raw: &Value, account_label: Option<String>) -> P
     }
 }
 
-/// Which shared pool and window a bucket describes, from the bucket id, the
-/// group display name, or the `window` discriminator. The vendor has renamed
-/// bucket ids before; the group name is the durable part.
-fn classify(id: &str, group: &str, window: Option<&str>) -> Option<(Pool, bool)> {
-    let id = id.to_ascii_lowercase();
-    let group = group.to_ascii_lowercase();
-    let weekly = match window {
+struct BucketRef<'a> {
+    bucket: &'a Value,
+    pool: Pool,
+    weekly: bool,
+}
+
+fn locate<'a>(buckets: &'a [BucketRef<'a>], spec: &WindowSpec) -> Option<&'a Value> {
+    buckets
+        .iter()
+        .find(|candidate| candidate.pool == spec.pool && candidate.weekly == spec.weekly)
+        .map(|candidate| candidate.bucket)
+}
+
+/// Flatten the groups of every summary into classified buckets, keeping the
+/// first bucket seen for each pool/window pair.
+fn collect_buckets<'a>(summaries: &[&'a Value]) -> Vec<BucketRef<'a>> {
+    let mut buckets: Vec<BucketRef<'a>> = Vec::new();
+    for summary in summaries {
+        for group in summary_groups(summary) {
+            let group_name = group
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let Some(group_buckets) = group.get("buckets").and_then(Value::as_array) else {
+                continue;
+            };
+            for bucket in group_buckets {
+                let Some((pool, weekly)) = classify_bucket(bucket, group_name) else {
+                    continue;
+                };
+                if buckets
+                    .iter()
+                    .any(|existing| existing.pool == pool && existing.weekly == weekly)
+                {
+                    continue;
+                }
+                buckets.push(BucketRef {
+                    bucket,
+                    pool,
+                    weekly,
+                });
+            }
+        }
+    }
+    buckets
+}
+
+/// The AI Code endpoint wraps the same summary the Cloud Code endpoint returns
+/// directly, so accept either shape (and the unwrapped form) rather than pinning
+/// the client to one wrapper version.
+fn summary_groups(raw: &Value) -> &[Value] {
+    let candidates = [
+        raw.get("summary")
+            .and_then(|summary| summary.get("response")),
+        raw.get("summary"),
+        raw.get("response"),
+        Some(raw),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if let Some(groups) = candidate.get("groups").and_then(Value::as_array) {
+            return groups;
+        }
+    }
+    &[]
+}
+
+/// Recover the Gemini 5-hour window from `fetchAvailableModels`.
+///
+/// The Gemini pool does not appear in the quota summaries the CLI reads, but
+/// the models response includes a `quotaInfo` block per model. Every Gemini
+/// model shares the pool's 5-hour reading, so the strictest fraction across
+/// those models is the number to report. Models without a fraction (Claude/GPT
+/// while their weekly limit is exhausted) or without a reset time (internal tab
+/// models) are skipped.
+pub fn gemini_quota_from_models(models: &Value) -> Option<Value> {
+    let models = models.get("models")?.as_object()?;
+
+    let mut fraction: Option<f64> = None;
+    let mut reset_time: Option<&Value> = None;
+    for model in models.values() {
+        // Only the Gemini pool shares a quota this way; an Anthropic/OpenAI
+        // model in the same list reports its own pool's numbers.
+        if let Some(provider) = model.get("apiProvider").and_then(Value::as_str) {
+            if !provider.contains("GOOGLE_GEMINI") {
+                continue;
+            }
+        }
+        let Some(quota) = model.get("quotaInfo") else {
+            continue;
+        };
+        let Some(remaining) = quota.get("remainingFraction").and_then(as_number) else {
+            continue;
+        };
+        let Some(reset) = quota.get("resetTime").filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if fraction.is_none_or(|current| remaining < current) {
+            fraction = Some(remaining);
+            reset_time = Some(reset);
+        }
+    }
+
+    Some(json!({
+        "groups": [{
+            "displayName": "Gemini Models",
+            "buckets": [{
+                "bucketId": "gemini-models-5h",
+                "displayName": "Five Hour Limit Remaining",
+                "window": "5h",
+                "remainingFraction": fraction?,
+                "resetTime": reset_time?,
+            }]
+        }]
+    }))
+}
+
+/// Which pool and window a bucket describes.
+///
+/// The group display name wins over the bucket id: a bucket named `argon-*`
+/// still belongs to the Gemini pool when the group says "Gemini Models", while
+/// Antigravity's own quota view puts `Gemini 4 Argon` in a group of its own.
+/// Bucket ids are the fallback for payloads that carry no group names.
+fn classify_bucket(bucket: &Value, group_name: &str) -> Option<(Pool, bool)> {
+    let id = bucket
+        .get("bucketId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let weekly = match bucket.get("window").and_then(Value::as_str) {
         Some("weekly") => true,
         Some("5h") => false,
         _ if id.ends_with("weekly") => true,
         _ if id.ends_with("5h") => false,
         _ => return None,
     };
-    // The bucket id is the most specific signal; the group name is the fallback
-    // for a renamed id. Do not let a group name override an id that says `3p`.
-    let pool = if id.starts_with("gemini") || id.starts_with("argon") {
+
+    let group = group_name.to_ascii_lowercase();
+    let pool = if group.contains("argon") {
+        Pool::Argon
+    } else if group.contains("claude") || group.contains("gpt") {
+        Pool::ThirdParty
+    } else if group.contains("gemini") || id.starts_with("gemini") || id.starts_with("argon") {
         Pool::Gemini
     } else if id.starts_with("3p") || id.starts_with("claude") || id.starts_with("gpt") {
-        Pool::ThirdParty
-    } else if group.contains("gemini") || group.contains("argon") {
-        Pool::Gemini
-    } else if group.contains("claude") || group.contains("gpt") {
         Pool::ThirdParty
     } else {
         return None;
@@ -221,23 +345,6 @@ fn window_from(bucket: &Value, label: &str) -> UsageWindow {
         },
         reset_at: bucket.get("resetTime").and_then(parse_reset_at),
     }
-}
-
-/// Buckets are nested inside groups; the caller supplies the ids that have
-/// historically named a slot.
-fn find_bucket(raw: &Value, bucket_ids: &[&str]) -> Option<Value> {
-    raw.get("groups")?
-        .as_array()?
-        .iter()
-        .filter_map(|group| group.get("buckets")?.as_array())
-        .flatten()
-        .find(|bucket| {
-            bucket
-                .get("bucketId")
-                .and_then(Value::as_str)
-                .is_some_and(|id| bucket_ids.contains(&id))
-        })
-        .cloned()
 }
 
 /// Numbers sometimes arrive as strings in this API.
@@ -329,9 +436,18 @@ pub async fn fetch_local_usage() -> Result<ProviderUsage, LocalUsageError> {
     let credentials = read_any_credentials().map_err(LocalUsageError::Credentials)?;
     let client = reqwest::Client::new();
 
-    let oauth = oauth_client_for(credentials.issued_to_client_id.as_deref()).ok_or_else(|| {
-        LocalUsageError::UnknownOauthClient(credentials.issued_to_client_id.clone())
-    })?;
+    // The CLI's current keyring payload names the account but carries no id
+    // token, so it cannot name its OAuth client. A CLI-owned token can safely
+    // use Antigravity's single registered client; the shared Gemini file still
+    // has to prove which client issued it.
+    let oauth = oauth_client_for(credentials.issued_to_client_id.as_deref())
+        .or_else(|| {
+            (credentials.cli_owned && credentials.issued_to_client_id.is_none())
+                .then(|| OAUTH_CLIENTS[0])
+        })
+        .ok_or_else(|| {
+            LocalUsageError::UnknownOauthClient(credentials.issued_to_client_id.clone())
+        })?;
 
     let access_token = resolve_access_token(&client, &credentials, &oauth).await?;
 
@@ -360,8 +476,8 @@ pub async fn fetch_local_usage() -> Result<ProviderUsage, LocalUsageError> {
     let project_payload = json!({ "project": project });
 
     // The quota endpoint answers with empty buckets unless the models call has
-    // run first, which is why this request is made and its body discarded.
-    post_code_assist(
+    // run first. Its body is kept as a fallback for the Gemini 5-hour window.
+    let models = post_code_assist(
         &client,
         &oauth,
         &access_token,
@@ -369,6 +485,12 @@ pub async fn fetch_local_usage() -> Result<ProviderUsage, LocalUsageError> {
         &project_payload,
     )
     .await?;
+
+    // The Gemini pool is not part of the Cloud Code summary. Ask the AI Code
+    // summary as well, and recover at least the 5-hour reading from the models
+    // response when the summaries do not carry it.
+    let aicode = fetch_aicode_quota(&client, &access_token).await.ok();
+    let models_quota = gemini_quota_from_models(&models);
 
     let quota = post_code_assist(
         &client,
@@ -379,8 +501,16 @@ pub async fn fetch_local_usage() -> Result<ProviderUsage, LocalUsageError> {
     )
     .await?;
 
-    Ok(normalize_quota_response(
-        &quota,
+    // AI Code first: when more than one source describes a window, its reading
+    // wins, then the models fallback, then the Cloud Code summary.
+    let summaries: Vec<&Value> = aicode
+        .iter()
+        .chain(models_quota.iter())
+        .chain(std::iter::once(&quota))
+        .collect();
+
+    Ok(normalize_quota_summaries(
+        &summaries,
         credentials.email.clone().or_else(|| tier_name(&load)),
     ))
 }
@@ -490,6 +620,57 @@ async fn post_code_assist(
 
     serde_json::from_str(&text)
         .map_err(|_| LocalUsageError::Request(format!("{} returned unreadable JSON", endpoint)))
+}
+
+/// Read the AI Code quota summary with the same token the Cloud Code calls use.
+///
+/// This is the only source for the Gemini pool's weekly window and for the
+/// separate Gemini 4 Argon allowance, so it is worth a request of its own. The
+/// endpoint requires the `auth/aicode` OAuth scope; a token without it fails
+/// with 403, which the caller treats as "Gemini numbers unavailable".
+async fn fetch_aicode_quota(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<Value, LocalUsageError> {
+    let response = client
+        .get(AICODE_QUOTA_ENDPOINT)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", access_token),
+        )
+        .header(reqwest::header::ACCEPT, "*/*")
+        .header(
+            reqwest::header::USER_AGENT,
+            user_agent(RETRIEVE_QUOTA_ENDPOINT),
+        )
+        .header("x-goog-api-client", X_GOOG_API_CLIENT)
+        .send()
+        .await
+        .map_err(|err| LocalUsageError::Request(err.to_string()))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| LocalUsageError::Request(err.to_string()))?;
+
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(LocalUsageError::Unauthorized);
+    }
+    if !status.is_success() {
+        return Err(LocalUsageError::Request(format!(
+            "AI Code quota status={} body_length={}",
+            status.as_u16(),
+            text.len()
+        )));
+    }
+
+    if text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+
+    serde_json::from_str(&text)
+        .map_err(|_| LocalUsageError::Request("AI Code quota returned unreadable JSON".to_string()))
 }
 
 /// The project id arrives either as a bare string or as an object.

@@ -10,6 +10,9 @@ All notable changes to this project will be documented here.
 
 ### 🐛 Fixes
 
+- Antigravity's Gemini 5-hour window no longer reports `null`: it is recovered from the per-model `quotaInfo` block in `fetchAvailableModels`. The Gemini weekly window and the separate `Gemini 4 Argon` weekly allowance are only present when Antigravity's AI Code quota summary exposes them, so they can stay blank; that summary is now fetched and merged when it has anything to add.
+- Antigravity's keychain entry is read through `/usr/bin/security` on macOS, the tool the CLI writes it with, so reading it never shows an unlock prompt. The current keyring payload names the account without an id token, so the address is read from its `id_token_email` and a CLI-owned token is attributed to Antigravity's registered OAuth client.
+
 - Antigravity's two shared pools now carry explicit labels: `Gemini/Argon` (including Gemini 4 Argon) and `Claude/GPT` (Claude Opus, Claude Sonnet, GPT-OSS). Renamed buckets are routed by group name plus the `window` discriminator, and a disabled 5-hour bucket reports 0 instead of its stale fraction.
 
 ## 1.7.1 and quota-vscode 1.5.2 - October 29, 2026

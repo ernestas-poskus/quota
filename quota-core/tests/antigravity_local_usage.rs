@@ -1,4 +1,7 @@
-use quota_core::antigravity::local_usage::{normalize_quota_response, project_id, user_agent};
+use quota_core::antigravity::local_usage::{
+    gemini_quota_from_models, normalize_quota_response, normalize_quota_summaries, project_id,
+    user_agent,
+};
 use serde_json::json;
 
 fn quota_payload() -> serde_json::Value {
@@ -56,13 +59,13 @@ fn the_third_party_windows_are_still_carried_in_full() {
 
 #[test]
 fn group_names_route_renamed_buckets_to_the_right_pool() {
-    // The vendor has renamed bucket ids before. A bucket whose id is new still
-    // lands in the right slot when its group names Gemini/Argon or Claude/GPT
-    // and its window says 5h or weekly.
+    // The vendor has renamed bucket ids before; the group display name is the
+    // durable signal. A bucket id that says `argon` still belongs to the Gemini
+    // pool when the group says "Gemini Models".
     let raw = json!({
         "groups": [
             {
-                "displayName": "Gemini 4 Argon",
+                "displayName": "Gemini Models",
                 "buckets": [
                     { "bucketId": "argon-weekly", "window": "weekly", "remainingFraction": 0.6 }
                 ]
@@ -82,6 +85,169 @@ fn group_names_route_renamed_buckets_to_the_right_pool() {
     assert_eq!(usage.windows[1].remaining_percent, Some(60));
     assert_eq!(usage.windows[2].label, "Claude/GPT 5h");
     assert_eq!(usage.windows[2].remaining_percent, Some(40));
+}
+
+/// The AI Code summary. It carries the Gemini pool and the separate Gemini 4
+/// Argon allowance, and wraps the same group/bucket shape the Cloud Code
+/// summary returns directly.
+fn aicode_payload() -> serde_json::Value {
+    json!({
+        "summary": {
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            { "bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.94, "resetTime": "2027-01-01T00:00:00Z" },
+                            { "bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.53 }
+                        ]
+                    },
+                    {
+                        "displayName": "Gemini 4 Argon",
+                        "buckets": [
+                            { "bucketId": "argon-weekly", "window": "weekly", "remainingFraction": 1 }
+                        ]
+                    }
+                ]
+            }
+        }
+    })
+}
+
+fn models_payload() -> serde_json::Value {
+    json!({
+        "models": {
+            "gemini-3-flash": {
+                "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                "quotaInfo": { "remainingFraction": 0.94, "resetTime": "2027-01-01T00:00:00Z" }
+            },
+            "gemini-3-flash-fast": {
+                "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                "quotaInfo": { "remainingFraction": 0.9, "resetTime": "2027-01-01T00:00:00Z" }
+            },
+            "claude-sonnet-5-5-high": {
+                "apiProvider": "API_PROVIDER_ANTHROPIC_VERTEX",
+                "quotaInfo": { "remainingFraction": 0.1, "resetTime": "2027-01-01T00:00:00Z" }
+            },
+            "chat_20706": {
+                "apiProvider": "API_PROVIDER_INTERNAL",
+                "quotaInfo": { "remainingFraction": 1 }
+            }
+        }
+    })
+}
+
+#[test]
+fn the_models_response_recovers_the_gemini_five_hour_window() {
+    // The models response carries the pool's 5-hour reading even when the AI
+    // Code summary is out of reach, so the Gemini slot is not left blank. The
+    // strictest reading wins, and other pools plus internal models are skipped.
+    let derived = gemini_quota_from_models(&models_payload()).expect("derive Gemini summary");
+
+    let usage = normalize_quota_summaries(&[&derived], None);
+
+    assert_eq!(usage.windows[0].label, "Gemini/Argon 5h");
+    assert_eq!(usage.windows[0].remaining_percent, Some(90));
+    assert_eq!(usage.windows[0].reset_at, Some(1_798_761_600));
+    // Only the 5-hour window can be recovered this way; the rest stay unknown.
+    assert_eq!(usage.windows[1].remaining_percent, None);
+    assert_eq!(usage.windows[3].remaining_percent, None);
+}
+
+#[test]
+fn the_models_fallback_never_overrides_a_summary() {
+    let aicode = aicode_payload();
+    let derived = gemini_quota_from_models(&models_payload()).expect("derive Gemini summary");
+
+    let usage = normalize_quota_summaries(&[&aicode, &derived], None);
+
+    // AI Code reports 94%; the models fallback would be 90%.
+    assert_eq!(usage.windows[0].remaining_percent, Some(94));
+}
+
+#[test]
+fn a_models_response_without_quota_yields_no_summary() {
+    let empty = json!({ "models": {} });
+    let no_reset = json!({
+        "models": {
+            "chat_1": { "quotaInfo": { "remainingFraction": 1 } }
+        }
+    });
+
+    assert!(gemini_quota_from_models(&empty).is_none());
+    assert!(gemini_quota_from_models(&no_reset).is_none());
+    assert!(gemini_quota_from_models(&json!({})).is_none());
+}
+
+#[test]
+fn the_ai_code_summary_fills_the_gemini_pool_and_appends_argon() {
+    let aicode = aicode_payload();
+
+    let usage = normalize_quota_summaries(&[&aicode], None);
+
+    assert_eq!(usage.windows.len(), 5);
+    assert_eq!(usage.windows[0].label, "Gemini/Argon 5h");
+    assert_eq!(usage.windows[0].remaining_percent, Some(94));
+    assert_eq!(usage.windows[0].reset_at, Some(1_798_761_600));
+    assert_eq!(usage.windows[1].remaining_percent, Some(53));
+    // The separate Gemini 4 Argon allowance follows the four standard windows.
+    assert_eq!(usage.windows[4].label, "Gemini 4 Argon Wk");
+    assert_eq!(usage.windows[4].remaining_percent, Some(100));
+}
+
+#[test]
+fn both_summaries_merge_into_one_record() {
+    // Gemini/Argon comes from the AI Code summary, Claude/GPT from Cloud Code.
+    let aicode = aicode_payload();
+    let cloud = quota_payload();
+
+    let usage = normalize_quota_summaries(&[&aicode, &cloud], None);
+
+    assert_eq!(usage.windows.len(), 5);
+    assert_eq!(usage.windows[0].remaining_percent, Some(94));
+    assert_eq!(usage.windows[2].label, "Claude/GPT 5h");
+    assert_eq!(usage.windows[2].remaining_percent, Some(50));
+    assert_eq!(usage.windows[3].remaining_percent, Some(31));
+}
+
+#[test]
+fn the_first_summary_wins_when_both_report_a_window() {
+    // The AI Code summary is passed first, so its reading, not Cloud Code's, is
+    // the one the desktop app shows.
+    let aicode = json!({
+        "groups": [{
+            "displayName": "Claude and GPT models",
+            "buckets": [
+                { "bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.25 }
+            ]
+        }]
+    });
+    let cloud = quota_payload();
+
+    let usage = normalize_quota_summaries(&[&aicode, &cloud], None);
+
+    assert_eq!(usage.windows[3].remaining_percent, Some(25));
+}
+
+#[test]
+fn the_ai_code_summary_is_accepted_with_or_without_its_wrapper() {
+    // The AI Code endpoint wraps the summary twice today; ride out a wrapper
+    // rename without losing the numbers.
+    let body = json!({
+        "groups": [{
+            "displayName": "Gemini Models",
+            "buckets": [
+                { "bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.42 }
+            ]
+        }]
+    });
+    let wrapped_once = json!({ "summary": body.clone() });
+    let bare = body;
+
+    for raw in [wrapped_once, bare] {
+        let usage = normalize_quota_summaries(&[&raw], None);
+        assert_eq!(usage.windows[1].remaining_percent, Some(42));
+    }
 }
 
 #[test]

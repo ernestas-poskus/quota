@@ -132,7 +132,7 @@ kiro         Credits 100% left · Bonus 100% left
 
 Percentages are what you have left. Reset times show when a provider reports one. Anything you're not signed into says so instead of showing a number. Add `--json` for scripting.
 
-Antigravity reports two shared pools, not per-model quotas: **Gemini/Argon** (Gemini 4 Argon and the Gemini models share it) and **Claude/GPT** (Claude Opus, Claude Sonnet, and GPT-OSS share it). Each pool has a 5-hour and a weekly window, so the four numbers are two pools × two windows.
+Antigravity reports two shared pools, not per-model quotas: **Gemini/Argon** (the Gemini models) and **Claude/GPT** (Claude Opus, Claude Sonnet, and GPT-OSS share it). Each pool has a 5-hour and a weekly window. Gemini's 5-hour reading comes from the model quota block; the Gemini weekly window and the separate `Gemini 4 Argon` weekly allowance only appear when Antigravity's AI Code quota summary exposes them (consumer sign-ins currently expose only the Claude/GPT group), so those two can be blank. Antigravity's keychain entry is read through `/usr/bin/security` on macOS, so no unlock prompt appears.
 
 It covers Claude, Codex, Cursor, Antigravity, Grok, and Kiro. GitHub Copilot is desktop-only for now. Every reader is strictly read-only: nothing is refreshed, rewritten, or rotated, because those tokens back your own agent sessions.
 
