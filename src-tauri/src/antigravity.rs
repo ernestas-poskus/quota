@@ -32,6 +32,8 @@ const ANTIGRAVITY_OAUTH_SCOPES: [&str; 5] = [
 ];
 const ANTIGRAVITY_IDE_VERSION: &str = "1.20.5";
 const ANTIGRAVITY_GOOGLE_API_NODEJS_CLIENT_VERSION: &str = "10.3.0";
+/// Google only returns the Gemini quota group to the Antigravity CLI's user agent.
+const ANTIGRAVITY_CLI_VERSION: &str = "1.4.10";
 const ANTIGRAVITY_X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 
 static PENDING_ANTIGRAVITY_OAUTH: std::sync::LazyLock<Arc<Mutex<Option<PendingAntigravityOAuth>>>> =
@@ -1175,6 +1177,14 @@ fn code_assist_url(path: &str) -> String {
 }
 
 fn code_assist_user_agent(endpoint: &str) -> String {
+    if endpoint.contains(CODE_ASSIST_RETRIEVE_QUOTA_ENDPOINT) {
+        return format!(
+            "antigravity/cli/{} {}/{}",
+            ANTIGRAVITY_CLI_VERSION,
+            antigravity_user_agent_os(),
+            antigravity_user_agent_arch()
+        );
+    }
     let base = format!(
         "antigravity/{} {}/{}",
         ANTIGRAVITY_IDE_VERSION,

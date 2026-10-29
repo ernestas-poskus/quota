@@ -1,4 +1,4 @@
-use quota_core::antigravity::local_usage::{normalize_quota_response, project_id};
+use quota_core::antigravity::local_usage::{normalize_quota_response, project_id, user_agent};
 use serde_json::json;
 
 fn quota_payload() -> serde_json::Value {
@@ -158,4 +158,17 @@ fn the_project_id_reads_from_every_shape_google_sends() {
         project_id(&json!({ "cloudaicompanionProject": "  " })),
         None
     );
+}
+
+#[test]
+fn the_quota_summary_call_uses_the_cli_user_agent() {
+    // Without it, Google leaves the Gemini group out of the quota summary (issue #17).
+    assert!(user_agent("v1internal:retrieveUserQuotaSummary").starts_with("antigravity/cli/"));
+}
+
+#[test]
+fn the_other_code_assist_calls_keep_the_ide_user_agent() {
+    assert!(user_agent("v1internal:fetchAvailableModels").starts_with("antigravity/1."));
+    let load = user_agent("v1internal:loadCodeAssist");
+    assert!(load.starts_with("antigravity/1.") && load.contains("google-api-nodejs-client/"));
 }

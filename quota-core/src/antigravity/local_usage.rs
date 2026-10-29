@@ -57,6 +57,8 @@ const RETRIEVE_QUOTA_ENDPOINT: &str = "v1internal:retrieveUserQuotaSummary";
 
 const IDE_VERSION: &str = "1.20.5";
 const GOOGLE_API_NODEJS_CLIENT_VERSION: &str = "10.3.0";
+/// Google only returns the Gemini quota group to the Antigravity CLI's user agent.
+const CLI_VERSION: &str = "1.4.10";
 const X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 
 /// The two windows the compact token shows, in order.
@@ -392,7 +394,10 @@ fn tier_name(load: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn user_agent(endpoint: &str) -> String {
+pub fn user_agent(endpoint: &str) -> String {
+    if endpoint.contains(RETRIEVE_QUOTA_ENDPOINT) {
+        return format!("antigravity/cli/{} {}/{}", CLI_VERSION, os_name(), arch_name());
+    }
     let base = format!("antigravity/{} {}/{}", IDE_VERSION, os_name(), arch_name());
     if endpoint.contains(LOAD_ENDPOINT) {
         format!(

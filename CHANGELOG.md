@@ -4,6 +4,10 @@ All notable changes to this project will be documented here.
 
 ## Unreleased
 
+### 🐛 Fixes
+
+- Antigravity Gemini `5h` and `Wk` windows show up again. Google now only includes the Gemini group in `retrieveUserQuotaSummary` when the User-Agent looks like the Antigravity CLI, so every client got Claude/GPT numbers back and nothing for Gemini, on every platform. The quota call now sends `antigravity/cli/1.4.10 <os>/<arch>`, and the other Code Assist calls keep their old UA. Fixed in `quota-core` (so `quota-cli` and Herdr), the desktop app, and the VS Code extension. ([#17](https://github.com/pinkpixel-dev/quota/issues/17))
+
 ### 🌐 Website
 
 - Added `website/`, a homepage and docs site built with Astro and Starlight. It covers the desktop app, the VS Code extension, `quota-cli`, and the Herdr plugin, with screenshots, install steps, and direct download links for each release.

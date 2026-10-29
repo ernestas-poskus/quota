@@ -27,6 +27,8 @@ const CODE_ASSIST_FETCH_MODELS_ENDPOINT = 'v1internal:fetchAvailableModels';
 const CODE_ASSIST_RETRIEVE_QUOTA_ENDPOINT = 'v1internal:retrieveUserQuotaSummary';
 const ANTIGRAVITY_IDE_VERSION = '1.20.5';
 const ANTIGRAVITY_GOOGLE_API_NODEJS_CLIENT_VERSION = '10.3.0';
+// Google only returns the Gemini quota group to the Antigravity CLI's user agent.
+const ANTIGRAVITY_CLI_VERSION = '1.4.10';
 const ANTIGRAVITY_X_GOOG_API_CLIENT = 'gl-node/22.21.1';
 const ANTIGRAVITY_SECRET_KEY = 'quota.antigravity.credentials';
 const ANTIGRAVITY_ACCOUNTS_KEY = 'quota.antigravity.accounts';
@@ -226,6 +228,9 @@ function codeAssistUrl(path: string): string {
 }
 
 function codeAssistUserAgent(endpoint: string): string {
+  if (endpoint.includes(CODE_ASSIST_RETRIEVE_QUOTA_ENDPOINT)) {
+    return `antigravity/cli/${ANTIGRAVITY_CLI_VERSION} ${userAgentOs()}/${userAgentArch()}`;
+  }
   const base = `antigravity/${ANTIGRAVITY_IDE_VERSION} ${userAgentOs()}/${userAgentArch()}`;
   if (endpoint.includes(CODE_ASSIST_LOAD_ENDPOINT)) {
     return `${base} google-api-nodejs-client/${ANTIGRAVITY_GOOGLE_API_NODEJS_CLIENT_VERSION}`;
