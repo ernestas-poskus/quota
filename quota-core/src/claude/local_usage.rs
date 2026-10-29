@@ -95,8 +95,5 @@ pub async fn fetch_local_usage() -> Result<ProviderUsage, LocalUsageError> {
     let raw: Value =
         serde_json::from_str(&body).map_err(|err| LocalUsageError::Request(err.to_string()))?;
 
-    Ok(normalize_usage_response(
-        &raw,
-        credentials.subscription_type,
-    ))
+    Ok(normalize_usage_response(&raw, credentials.subscription_type))
 }

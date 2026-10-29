@@ -359,20 +359,48 @@ fn keyring_entry() -> keyring::Result<keyring_core::Entry> {
     keyring_core::Entry::new_with_modifiers(KEYRING_SERVICE, KEYRING_USER, &modifiers)
 }
 
-/// Credentials for whichever Antigravity sign-in we can find, preferring the
-/// CLI token file over the keyring entry (to avoid OS keychain authorization
-/// prompts) and falling back to the Gemini file. When none is present the
-/// keyring's error is the one reported, since it is the primary source for the CLI.
+/// Credentials for whichever Antigravity sign-in we can find.
 pub fn read_any_credentials() -> Result<LocalAntigravityCredentials, LocalCredentialError> {
-    if let Ok(credentials) = read_cli_credentials() {
-        return Ok(credentials);
+    choose_credentials(
+        read_cli_credentials(),
+        read_keyring_credentials,
+        read_local_credentials,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
+/// Picks between the three Antigravity sources. The CLI token file wins while
+/// its token is still good, so macOS never touches the keychain (and its
+/// authorization prompt) when the file is fresh. Otherwise the keyring comes
+/// next, since newer `agy` builds on Linux keep the live token there and leave
+/// the file behind. An expired file is still better than nothing, because the
+/// refresh token in it usually works. The Gemini file is the last resort.
+///
+/// When nothing is usable, a broken CLI file is reported over the keyring's
+/// error so it does not hide behind a misleading "not found".
+pub fn choose_credentials(
+    cli: Result<LocalAntigravityCredentials, LocalCredentialError>,
+    keyring: impl FnOnce() -> Result<LocalAntigravityCredentials, LocalCredentialError>,
+    gemini_file: impl FnOnce() -> Result<LocalAntigravityCredentials, LocalCredentialError>,
+    now_ms: i64,
+) -> Result<LocalAntigravityCredentials, LocalCredentialError> {
+    if let Ok(credentials) = &cli {
+        if !credentials.needs_refresh_at_ms(now_ms) {
+            return cli;
+        }
     }
-    let keyring_result = read_keyring_credentials();
+    let keyring_result = keyring();
     if keyring_result.is_ok() {
         return keyring_result;
     }
-    match read_local_credentials() {
-        Ok(credentials) => Ok(credentials),
-        Err(_) => keyring_result,
+    if cli.is_ok() {
+        return cli;
+    }
+    if let Ok(credentials) = gemini_file() {
+        return Ok(credentials);
+    }
+    match cli {
+        Err(LocalCredentialError::NotFound) => keyring_result,
+        broken => broken,
     }
 }
