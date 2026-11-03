@@ -61,6 +61,12 @@ const RETRIEVE_QUOTA_ENDPOINT: &str = "v1internal:retrieveUserQuotaSummary";
 const AICODE_QUOTA_ENDPOINT: &str =
     "https://aicode.googleapis.com/v1alpha/remote:getUserQuotaSummary";
 
+/// The AI Code summary is optional enrichment, and the Cloud Code quota request
+/// runs after it. `reqwest` sets no default timeout, so a stalled endpoint here
+/// would hold up the whole refresh; bound it to the same grace as the CLI
+/// fallback without touching the shared client.
+const AICODE_QUOTA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// The Antigravity CLI's own quota view, in print mode with structured output.
 ///
 /// The CLI renders the Gemini weekly window and the separate `Gemini 4 Argon`
@@ -748,13 +754,15 @@ pub fn needs_agy_fallback(summaries: &[&Value]) -> bool {
 /// The two backends have not always returned the same groups, so both are
 /// asked. The endpoint requires the `auth/aicode` OAuth scope in some
 /// deployments; a token without it fails with 403, which the caller treats as
-/// "this summary has nothing to add".
+/// "this summary has nothing to add". The request carries its own timeout, so
+/// this optional source cannot delay the required calls.
 async fn fetch_aicode_quota(
     client: &reqwest::Client,
     access_token: &str,
 ) -> Result<Value, LocalUsageError> {
     let response = client
         .get(AICODE_QUOTA_ENDPOINT)
+        .timeout(AICODE_QUOTA_TIMEOUT)
         .header(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {}", access_token),
